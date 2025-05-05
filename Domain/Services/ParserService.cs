@@ -7,142 +7,177 @@ namespace Domain.Services;
 
 public static class ParserService
 {
-    public static Result<ParsedQuery> Parse(string sql)
+    public static Result<string> Parse(string sql)
     {
         if (string.IsNullOrWhiteSpace(sql))
-            return Result<ParsedQuery>.Failure("Query is empty.");
+            return Result<string>.Failure("Query is empty.");
 
-        var parsedQuery = new ParsedQuery();
+        var parseResult = ParseQuery(sql);
+
+        if (parseResult.IsFailure)
+            return Result<string>.Failure(parseResult.ErrorMessage);
+
+        var query = parseResult.Value!;
+
+        var validationResult = ValidateQuery(query);
+
+        if (validationResult.IsFailure)
+            return Result<string>.Failure(validationResult.ErrorMessage);
+
+        var algebra = GenerateRelationalAlgebra(query);
+
+        return Result<string>.Success(algebra);
+    }
+
+    private static Result<ParsedQuery> ParseQuery(string sql)
+    {
+        var parsed = new ParsedQuery();
 
         var selectMatch = RootRegex.SelectRegex().Match(sql);
-        if (selectMatch.Success)
-            parsedQuery.SelectClause = selectMatch.Groups[1].Value.Trim();
 
-        var fromMatch = RootRegex.FromRegex().Match(sql);
-        if (fromMatch.Success)
-            parsedQuery.FromClause = fromMatch.Groups[1].Value.Trim();
+        if (!selectMatch.Success)
+            return Result<ParsedQuery>.Failure(
+                "Malformed query: missing or invalid SELECT clause."
+            );
+
+        var fromMatch = RootRegex.FromWithAliasRegex().Match(sql);
+
+        if (!fromMatch.Success)
+            return Result<ParsedQuery>.Failure("Malformed query: missing or invalid FROM clause.");
+
+        parsed.SelectClause = selectMatch.Groups[1].Value.Trim();
+        parsed.FromClause = fromMatch.Groups[1].Value.Trim();
+
+        var aliasCandidate =
+            fromMatch.Groups[2].Success ? fromMatch.Groups[2].Value.Trim()
+            : fromMatch.Groups[3].Success ? fromMatch.Groups[3].Value.Trim()
+            : null;
+
+        parsed.FromAlias =
+            !string.IsNullOrEmpty(aliasCandidate) && !Keywords.IsReserved(aliasCandidate)
+                ? aliasCandidate
+                : parsed.FromClause;
+
+        parsed.TableAliases[parsed.FromAlias] = parsed.FromClause;
+
+        var joinMatches = RootRegex.JoinWithAliasRegex().Matches(sql);
+        foreach (var match in joinMatches.Cast<Match>())
+        {
+            var table = match.Groups[1].Value.Trim();
+            var aliasCandidateJoin = match.Groups[2].Success ? match.Groups[2].Value.Trim() : null;
+            var alias =
+                !string.IsNullOrEmpty(aliasCandidateJoin)
+                && !Keywords.IsReserved(aliasCandidateJoin)
+                    ? aliasCandidateJoin
+                    : table;
+
+            var condition = match.Groups[3].Value.Trim();
+            parsed.Joins.Add((table, alias, condition));
+            parsed.TableAliases[alias] = table;
+        }
 
         var whereMatch = RootRegex.WhereRegex().Match(sql);
         if (whereMatch.Success)
-            parsedQuery.WhereClause = whereMatch.Groups[1].Value.Trim();
+            parsed.WhereClause = whereMatch.Groups[1].Value.Trim();
 
-        var joinMatches = RootRegex.JoinRegex().Matches(sql);
-        foreach (Match joinMatch in joinMatches)
+        return Result<ParsedQuery>.Success(parsed);
+    }
+
+    private static Result<string> ValidateQuery(ParsedQuery query)
+    {
+        foreach (var table in query.TableAliases.Values.Distinct())
         {
-            var table = joinMatch.Groups[1].Value.Trim();
-            var condition = joinMatch.Groups[2].Value.Trim();
-            parsedQuery.Joins.Add((table, condition));
+            if (!Schema.Tables.Contains(table))
+                return Result<string>.Failure($"Table '{table}' does not exist.");
         }
 
-        if (!Schema.Tables.Contains(parsedQuery.FromClause))
-            return Result<ParsedQuery>.Failure(
-                $"Table '{parsedQuery.FromClause}' does not exist in the schema."
-            );
+        var fields = query.SelectClause.Split(',').Select(f => f.Trim()).ToList();
+        if (fields is [Keywords.ASTERISK])
+            return Result<string>.Success();
 
-        foreach (var join in parsedQuery.Joins.Where(join => !Schema.Tables.Contains(join.Table)))
+        foreach (var field in fields.Where(field => !FieldExists(field, query.TableAliases)))
         {
-            return Result<ParsedQuery>.Failure(
-                $"Table '{join.Table}' from JOIN does not exist in the schema."
-            );
+            return Result<string>.Failure($"Field '{field}' does not exist.");
         }
 
-        var selectFields = parsedQuery.SelectClause.Split(',').Select(f => f.Trim()).ToList();
+        return Result<string>.Success();
+    }
 
-        if (selectFields is not ["*"])
+    private static bool FieldExists(string field, Dictionary<string, string> aliases)
+    {
+        if (field.Contains('.'))
         {
-            if (!Schema.Columns.TryGetValue(parsedQuery.FromClause, out var availableColumns))
-                return Result<ParsedQuery>.Failure(
-                    $"Table '{parsedQuery.FromClause}' does not have registered columns in the schema."
-                );
+            var parts = field.Split('.');
+            if (parts.Length != 2)
+                return false;
 
-            foreach (var field in selectFields.Where(field => !availableColumns.Contains(field)))
-            {
-                return Result<ParsedQuery>.Failure(
-                    $"Field '{field}' does not exist in table '{parsedQuery.FromClause}'."
-                );
-            }
+            var prefix = parts[0];
+            var column = parts[1];
+
+            if (aliases.TryGetValue(prefix, out var table))
+                return Schema.Columns.TryGetValue(table, out var columns)
+                    && columns.Contains(column);
+
+            if (Schema.Tables.Contains(prefix))
+                return Schema.Columns.TryGetValue(prefix, out var columns)
+                    && columns.Contains(column);
+
+            return false;
         }
 
-        if (string.IsNullOrEmpty(parsedQuery.WhereClause))
-            return Result<ParsedQuery>.Success(parsedQuery);
-
-        var tokens = parsedQuery
-            .WhereClause.Replace("(", " ( ")
-            .Replace(")", " ) ")
-            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
-            .Select(t => t.Trim())
+        var possibleMatches = aliases
+            .Values.Distinct()
+            .Where(table =>
+                Schema.Columns.TryGetValue(table, out var columns) && columns.Contains(field)
+            )
             .ToList();
 
-        foreach (
-            var token in tokens
-                .Where(token =>
-                    !Keywords.Operators.Contains(token)
-                    && !Keywords.LogicalOperators.Contains(token)
-                )
-                .Where(token =>
-                    token != Keywords.OPEN_PARENTHESIS && token != Keywords.CLOSE_PARENTHESIS
-                )
-        )
+        return possibleMatches.Count == 1;
+    }
+
+    private static string GenerateRelationalAlgebra(ParsedQuery query)
+    {
+        var proj = query.SelectClause == Keywords.ASTERISK ? "π_*" : $"π_{query.SelectClause}";
+
+        var useAlias = query.FromAlias != query.FromClause;
+        var rel = useAlias ? $"{query.FromAlias} ← {query.FromClause}" : query.FromClause;
+
+        foreach (var (table, alias, cond) in query.Joins)
         {
-            if (!Schema.Columns.TryGetValue(parsedQuery.FromClause, out var availableColumns))
-                return Result<ParsedQuery>.Failure(
-                    $"Table '{parsedQuery.FromClause}' does not have columns for validation."
-                );
-
-            if (!availableColumns.Contains(token) && !IsLiteral(token))
-            {
-                return Result<ParsedQuery>.Failure(
-                    $"Unknown field or invalid token '{token}' in WHERE clause."
-                );
-            }
-
-            if (!availableColumns.Contains(token))
-                continue;
-
-            var index = tokens.IndexOf(token);
-
-            if (index + 2 >= tokens.Count)
-                continue;
-
-            var operatorToken = tokens[index + 1];
-            var valueToken = tokens[index + 2];
-
-            if (!Keywords.Operators.Contains(operatorToken))
-                continue;
-
-            if (!Schema.ColumnTypes.TryGetValue(parsedQuery.FromClause, out var tableColumns))
-                continue;
-
-            if (!tableColumns.TryGetValue(token, out var fieldType))
-                continue;
-
-            if (!IsCompatible(fieldType, valueToken))
-            {
-                return Result<ParsedQuery>.Failure(
-                    $"Type mismatch: Field '{token}' expects {fieldType}, but got '{valueToken}'."
-                );
-            }
+            rel = $"({rel} ⨝_{cond} {(alias != table ? $"{alias} ← {table}" : table)})";
         }
 
-        return Result<ParsedQuery>.Success(parsedQuery);
+        var where = string.IsNullOrWhiteSpace(query.WhereClause)
+            ? null
+            : $"σ_{TransformOperators(query.WhereClause)}";
+
+        return where is not null ? $"{proj}({where}({rel}))" : $"{proj}({rel})";
     }
 
-    private static bool IsLiteral(string token)
+    private static string TransformOperators(string cond)
     {
-        return int.TryParse(token, out _) || (token.StartsWith('\'') && token.EndsWith('\''));
-    }
+        cond = cond.Replace($" {Keywords.AND} ", " ∧ ").Replace($" {Keywords.OR} ", " ∨ ");
 
-    private static bool IsCompatible(string fieldType, string valueToken)
-    {
-        return fieldType switch
-        {
-            "int" => int.TryParse(valueToken, out _),
-            "decimal" => decimal.TryParse(valueToken, out _),
-            "string" => valueToken.StartsWith('\'') && valueToken.EndsWith('\''),
-            "date" => valueToken.StartsWith('\'')
-                && valueToken.EndsWith('\'')
-                && DateTime.TryParse(fieldType, out _),
-            _ => false,
-        };
+        var inMatch = RootRegex.InWithSubqueryRegex().Match(cond);
+
+        if (!inMatch.Success)
+            return cond;
+
+        var leftField = inMatch.Groups[1].Value.Trim();
+        var subquery = inMatch.Groups[2].Value.Trim();
+
+        var subParsed = Parse(subquery);
+        if (subParsed.IsFailure)
+            return cond;
+
+        var subMatch = RootRegex.SelectFieldFromTableRegex().Match(subquery);
+
+        if (!subMatch.Success)
+            return subParsed.Value!;
+
+        var rightField = subMatch.Groups[1].Value.Trim();
+        var subAlgebra = subParsed.Value!;
+
+        return $"{leftField} = {rightField} ⨝ ({subAlgebra})";
     }
 }
