@@ -19,10 +19,4 @@ public static partial class RootRegex
         "en-US"
     )]
     public static partial Regex JoinWithAliasRegex();
-
-    [GeneratedRegex(@"(\w+)\s+IN\s+\((SELECT.+)\)", RegexOptions.IgnoreCase)]
-    public static partial Regex InWithSubqueryRegex();
-
-    [GeneratedRegex(@"SELECT\s+(\w+)\s+FROM\s+(\w+)", RegexOptions.IgnoreCase)]
-    public static partial Regex SelectFieldFromTableRegex();
 }

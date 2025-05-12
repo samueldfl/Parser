@@ -14,9 +14,9 @@ public class QueryController : ControllerBase
 
         if (result.IsFailure)
         {
-            return NotFound(new { message = result.ErrorMessage });
+            return NotFound(result.ErrorMessage);
         }
 
-        return Ok(new { message = result.Value });
+        return Ok(result.Value);
     }
 }
